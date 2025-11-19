@@ -12,6 +12,7 @@ import os.path as osp
 import sys
 import time
 from utils import *
+from utils_rehub import ReHubNet
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='HCPGender')
@@ -96,8 +97,17 @@ seeds = [123,124]
 for index in range(args.runs):
     start = time.time()
     fix_seed(seeds[index])
-    gnn = eval(args.model)
-    model = ResidualGNNs(args,train_dataset,args.hidden,args.hidden_mlp,args.num_layers,gnn).to(args.device) ## apply GNN*
+    if args.model == "rehub":
+      model = ReHubNet(
+    args.num_features,   # in_features (positional)
+    args.hidden,         # hidden_dim
+    args.hidden_mlp,     # hidden_mlp
+    args.num_layers,     # num_layers
+    args.num_classes     # num_classes
+    ).to(args.device)
+    else:
+      gnn = eval(args.model)
+      model = ResidualGNNs(args,train_dataset,args.hidden,args.hidden_mlp,args.num_layers,gnn).to(args.device) ## apply GNN*
     print(model)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters is: {total_params}")
