@@ -1,4 +1,5 @@
 from NeuroGraph.datasets import NeuroGraphDataset
+from tangent_layer import fit_transform_tangent
 import argparse
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,24 @@ import os.path as osp
 import sys
 import time
 from utils import *
+
+class TangentMLP(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(TangentMLP, self).__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.BatchNorm1d(hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(hidden_dim, hidden_dim // 2),
+            torch.nn.BatchNorm1d(hidden_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim // 2, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='HCPGender')
@@ -59,68 +78,70 @@ train_dataset = tmp[train_indices]
 val_dataset = tmp[val_indices]
 test_dataset = dataset[test_indices]
 print("dataset {} loaded with train {} val {} test {} splits".format(args.dataset,len(train_dataset), len(val_dataset), len(test_dataset)))
-train_loader = DataLoader(train_dataset, args.batch_size, shuffle=False)
-val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False)
-test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False)
+train_loader = DataLoader(train_dataset, args.batch_size, shuffle=False,drop_last=True)
+val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False,drop_last=True)
+test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False,drop_last=True)
 args.num_features,args.num_classes = dataset.num_features,dataset.num_classes
+
+
+print("Starting Tangent Space Projection...")
+# This converts your graph data into Tangent Space Vectors
+(train_X_ts, train_y_ts), (val_X_ts, val_y_ts), (test_X_ts, test_y_ts) = fit_transform_tangent(train_loader, val_loader, test_loader, args.device)
+
+input_dim = train_X_ts.shape[1] # This is the size of the new feature vector
+print(f"New Input Dimension (Tangent Space): {input_dim}")
+
 
 criterion = torch.nn.CrossEntropyLoss()
 #criterion = torch.nn.L1Loss()
-def train(train_loader):
+def train_tangent(X, y, model, optimizer):
     model.train()
-    total_loss = 0
-    for data in train_loader:  
-        data = data.to(args.device)
-        out = model(data)  
-        loss = criterion(out, data.y) 
-        total_loss +=loss
-        loss.backward()
-        optimizer.step() 
-        optimizer.zero_grad()
-    return total_loss/len(train_loader.dataset)
-    # return total_loss/len(train_loader) # For L1 loss. This may retun higher loss on the regression tasks since the paper used (total_loss/len(train_loader.dataset))
+    optimizer.zero_grad()
+    out = model(X)
+    loss = criterion(out, y)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
 
 @torch.no_grad()
-def test(loader):
-    model.eval()
-    correct = 0
-    for data in loader:  
-        data = data.to(args.device)
-        out = model(data)  
-        pred = out.argmax(dim=1)  
-        correct += int((pred == data.y).sum())
-    return correct / len(loader.dataset)  
 
-val_acc_history, test_acc_history, test_loss_history = [],[],[]
-seeds = [123,124]
+def test_tangent(X, y, model):
+    model.eval()
+    out = model(X)
+    pred = out.argmax(dim=1)
+    correct = int((pred == y).sum())
+    return correct / len(y)
+
+# The Main Loop
+val_acc_history, test_acc_history, test_loss_history = [], [], []
+seeds = [args.seed + i for i in range(args.runs)]
+
+
 for index in range(args.runs):
-    start = time.time()
+    print(f"--- RUN {index+1}/{args.runs} ---")
     fix_seed(seeds[index])
-    gnn = eval(args.model)
-    model = ResidualGNNs(args,train_dataset,args.hidden,args.hidden_mlp,args.num_layers,gnn).to(args.device) ## apply GNN*
-    print(model)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total number of parameters is: {total_params}")
+    
+    # Initialize the TangentMLP instead of ResidualGNNs
+    model = TangentMLP(input_dim, args.hidden_mlp, args.num_classes).to(args.device)
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss, test_acc = [],[]
-    best_val_acc,best_val_loss = 0.0,0.0
+    
+    best_val_acc = 0.0
+    
     for epoch in range(args.epochs):
-        loss = train(train_loader)
-        val_acc = test(val_loader)
-        test_acc = test(test_loader)
-        # if epoch%10==0:
-        print("epoch: {}, loss: {}, val_acc:{}, test_acc:{}".format(epoch, np.round(loss.item(),6), np.round(val_acc,2),np.round(test_acc,2)))
-        val_acc_history.append(val_acc)
+        # Train on Tangent Vectors
+        loss = train_tangent(train_X_ts, train_y_ts, model, optimizer)
+        val_acc = test_tangent(val_X_ts, val_y_ts, model)
+        test_acc = test_tangent(test_X_ts, test_y_ts, model)
+        
+        print("epoch: {}, loss: {}, val_acc:{}, test_acc:{}".format(epoch, np.round(loss, 6), np.round(val_acc, 2), np.round(test_acc, 2)))
+        
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            if epoch> int(args.epochs/2):## save the best model
-                torch.save(model.state_dict(), path + args.dataset+args.model+'task-checkpoint-best-acc.pkl')
-       
+            if epoch > int(args.epochs / 2):
+                torch.save(model.state_dict(), path + args.dataset + 'TangentMLP' + 'task-checkpoint-best-acc.pkl')
 
-    #test the model   
-    model.load_state_dict(torch.load(path + args.dataset+args.model+'task-checkpoint-best-acc.pkl'))
-    model.eval()
-    test_acc = test(test_loader)
-    test_loss = train(test_loader).item()
-    test_acc_history.append(test_acc)
-    test_loss_history.append(test_loss)
+    # Load best model and test
+    model.load_state_dict(torch.load(path + args.dataset + 'TangentMLP' + 'task-checkpoint-best-acc.pkl'))
+    final_test_acc = test_tangent(test_X_ts, test_y_ts, model)
+    test_acc_history.append(final_test_acc)
+    print(f"Run {index+1} Final Test Acc: {final_test_acc}")
