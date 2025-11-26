@@ -6,217 +6,162 @@ from torch.optim import Adam
 import numpy as np
 from sklearn.model_selection import train_test_split
 from torch_geometric.loader import DataLoader
-import os, random, time
+import os
 from utils import fix_seed
-from tangent_layer import get_dataloaders_tangent # New Import
+from tangent_layer import map_to_tangent_matrix # Ensure tangent_layer.py exists
+from spdnet_layer import BiMap, ReEig, LogEig, stiefel_optimizer_step
 
-# --- BRAIN NETWORK TRANSFORMER ---
-class BrainTransformer(nn.Module):
-    def __init__(self, num_nodes, d_model, nhead, num_layers, num_classes):
-        super(BrainTransformer, self).__init__()
+# --- SPDNET ARCHITECTURE ---
+class SPDNet(nn.Module):
+    def __init__(self, in_dim, mid_dim, num_classes):
+        super(SPDNet, self).__init__()
         
-        # 1. Embedding
-        self.embedding = nn.Linear(num_nodes, d_model)
+        # Layer 1: Compress 1000x1000 -> 64x64
+        # This effectively learns the "Principal Components" on the manifold
+        self.layer1 = BiMap(in_dim, mid_dim)
+        self.act1 = ReEig()
         
-        # 2. The "Manager" (CLS) Token
-        # A learnable vector that will aggregate the brain's info
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+        # Layer 2: Compress 64x64 -> 32x32 (Optional deep layer)
+        self.layer2 = BiMap(mid_dim, mid_dim // 2)
+        self.act2 = ReEig()
         
-        # 3. Positional Encoding
-        # We add +1 to num_nodes to account for the CLS token
-        self.pos_encoder = nn.Parameter(torch.randn(1, num_nodes + 1, d_model))
+        # Layer 3: Flatten (Tangent Projection)
+        self.log_eig = LogEig()
         
-        # 4. Transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=d_model*4, # Standard expansion
-            dropout=0.5,               # Higher dropout to prevent overfitting
-            batch_first=True,
-            norm_first=True            # Pre-Norm helps convergence
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # 5. Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, num_classes)
-        )
+        # Layer 4: Standard Linear Classifier
+        # Input size is the upper triangle of the resulting matrix
+        flat_dim = ((mid_dim // 2) * ((mid_dim // 2) + 1)) // 2
+        self.classifier = nn.Linear(flat_dim, num_classes)
 
     def forward(self, x):
-        # x shape: (Batch, 1000, 1000)
+        # x: (Batch, 1000, 1000)
         
-        # 1. Embed features -> (Batch, 1000, d_model)
-        x = self.embedding(x)
+        x = self.layer1(x) # -> (Batch, 64, 64)
+        x = self.act1(x)
         
-        # 2. Add the Manager (CLS) Token to the front of every brain
-        # Shape becomes (Batch, 1001, d_model)
-        batch_size = x.size(0)
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        x = self.layer2(x) # -> (Batch, 32, 32)
+        x = self.act2(x)
         
-        # 3. Add Positional Encoding
-        x = x + self.pos_encoder
+        x = self.log_eig(x)
         
-        # 4. Attention Mechanism
-        x = self.transformer_encoder(x)
+        # Vectorize (Take upper triangle only)
+        # Because the result is symmetric, we only need half the values
+        batch, r, c = x.shape
+        idx = torch.triu_indices(r, c)
+        x_flat = x[:, idx[0], idx[1]]
         
-        # 5. Intelligent Aggregation
-        # Instead of averaging everything, we only look at the Manager (Index 0)
-        cls_output = x[:, 0, :]
-        
-        return self.classifier(cls_output)
+        return self.classifier(x_flat)
 
+# --- HELPER: GET RAW MATRICES (NO LOG) ---
+def get_raw_matrices(loader, device):
+    all_matrices = []
+    all_labels = []
+    
+    print("Loading data to GPU for preprocessing...")
+    
+    for data in loader:
+        # 1. Keep data as PyTorch Tensors and move to GPU immediately
+        num_graphs = data.num_graphs
+        num_nodes = data.x.shape[0] // num_graphs
+        
+        # Reshape: (Batch, 1000, 1000)
+        matrices = data.x.reshape(num_graphs, num_nodes, num_nodes).to(device)
+        labels = data.y.to(device)
+        
+        # 2. Symmetrize (on GPU)
+        # (A + A.T) / 2
+        matrices = (matrices + matrices.transpose(1, 2)) / 2.0
+        
+        # 3. Eigen Decomposition (on GPU)
+        # torch.linalg.eigh is MUCH faster than np.linalg.eigh
+        L, V = torch.linalg.eigh(matrices)
+        
+        # 4. Clip/Repair Eigenvalues
+        L = torch.clamp(L, min=1e-4)
+        
+        # 5. Reconstruct
+        # V @ diag(L) @ V.T
+        rec = torch.matmul(V * L.unsqueeze(1), V.transpose(-2, -1))
+        
+        all_matrices.append(rec)
+        all_labels.append(labels)
+    
+    # Concatenate all batches
+    X = torch.cat(all_matrices, dim=0)
+    y = torch.cat(all_labels, dim=0)
+    
+    print(f"Loaded {X.shape[0]} matrices on {device}.")
+    return X, y
+
+# --- SETUP ---
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='HCPGender')
-parser.add_argument('--runs', type=int, default=1)
 parser.add_argument('--device', type=str, default='cuda')
-parser.add_argument('--seed', type=int, default=123)
 parser.add_argument('--epochs', type=int, default=100)
 parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--lr', type=float, default=0.0001) # Lower LR for Transformers
-parser.add_argument('--weight_decay', type=float, default=0.0001)
-# Transformer Params
-parser.add_argument('--d_model', type=int, default=64) # Hidden dimension
-parser.add_argument('--nhead', type=int, default=4)    # Number of attention heads
-parser.add_argument('--num_layers', type=int, default=2) # Number of transformer layers
-
+parser.add_argument('--mid_dim', type=int, default=48) # Target dimension for BiMap
 args = parser.parse_args()
-path = "base_params/"
-root = "data/"
-if not os.path.isdir(path): os.mkdir(path)
 
-fix_seed(args.seed)
-dataset = NeuroGraphDataset(root=root, name=args.dataset)
-args.num_classes = dataset.num_classes
+fix_seed(123)
+dataset = NeuroGraphDataset(root="data/", name=args.dataset)
+# ... [Split code same as before] ...
+# (Copy the train/test/val splitting code from your previous main.py)
 labels = [d.y.item() for d in dataset]
-
-train_tmp, test_indices = train_test_split(list(range(len(labels))), test_size=0.2, stratify=labels, random_state=args.seed, shuffle=True)
+train_tmp, test_indices = train_test_split(list(range(len(labels))), test_size=0.2, stratify=labels, random_state=123, shuffle=True)
 tmp = dataset[train_tmp]
 train_labels = [d.y.item() for d in tmp]
-train_indices, val_indices = train_test_split(list(range(len(train_labels))), test_size=0.125, stratify=train_labels, random_state=args.seed, shuffle=True)
+train_indices, val_indices = train_test_split(list(range(len(train_labels))), test_size=0.125, stratify=train_labels, random_state=123, shuffle=True)
+train_loader = DataLoader(tmp[train_indices], args.batch_size, shuffle=False, drop_last=True)
+val_loader = DataLoader(tmp[val_indices], args.batch_size, shuffle=False, drop_last=True)
+test_loader = DataLoader(dataset[test_indices], args.batch_size, shuffle=False, drop_last=True)
 
-train_dataset = tmp[train_indices]
-val_dataset = tmp[val_indices]
-test_dataset = dataset[test_indices]
+# Load Data (Raw SPD Matrices)
+train_X, train_y = get_raw_matrices(train_loader, args.device)
+val_X, val_y = get_raw_matrices(val_loader, args.device)
+test_X, test_y = get_raw_matrices(test_loader, args.device)
 
-train_loader = DataLoader(train_dataset, args.batch_size, shuffle=False, drop_last=True)
-val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False, drop_last=True)
-test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False, drop_last=True)
+# Initialize
+model = SPDNet(in_dim=train_X.shape[1], mid_dim=args.mid_dim, num_classes=dataset.num_classes).to(args.device)
+optimizer = Adam(model.parameters(), lr=0.01) # SPDNet often needs higher LR
+criterion = nn.CrossEntropyLoss()
 
-# --- NEW DATA PREP ---
-(train_X, train_y), (val_X, val_y), (test_X, test_y) = get_dataloaders_tangent(train_loader, val_loader, test_loader, args.device)
-num_nodes = train_X.shape[1]
-print(f"Transformer Input Shape: {train_X.shape} (Batch, Nodes, Features)")
-# ---------------------
-
-criterion = torch.nn.CrossEntropyLoss()
-
-def train_transformer(X, y, model, optimizer, batch_size):
+# --- TRAINING LOOP ---
+best_acc = 0.0
+for epoch in range(args.epochs):
     model.train()
+    indices = torch.randperm(train_X.size(0))
     total_loss = 0
-    indices = torch.randperm(X.size(0))
     
-    # Mixup Parameters
-    alpha = 1.0 
-    use_mixup = True # Turn this on!
-
-    for i in range(0, X.size(0), batch_size):
-        idx = indices[i:i+batch_size]
-        batch_X, batch_y = X[idx], y[idx]
+    for i in range(0, train_X.size(0), args.batch_size):
+        idx = indices[i:i+args.batch_size]
+        batch_X, batch_y = train_X[idx], train_y[idx]
         
-        # --- MIXUP LOGIC START ---
-        if use_mixup and batch_X.size(0) > 1:
-            # 1. Generate mixing ratio (lambda) from Beta distribution
-            lam = np.random.beta(alpha, alpha)
-            
-            # 2. Shuffle the batch to get "Partner" brains
-            rand_idx = torch.randperm(batch_X.size(0))
-            batch_X_partner = batch_X[rand_idx]
-            batch_y_partner = batch_y[rand_idx]
-            
-            # 3. Create the "Hybrid" Brain (Linear interpolation in Tangent Space)
-            mixed_X = lam * batch_X + (1 - lam) * batch_X_partner
-            
-            # 4. Forward pass with Hybrid Brain
-            optimizer.zero_grad()
-            out = mixed_X # Just a placeholder variable name
-            out = model(mixed_X)
-            
-            # 5. Calculate "Mixed" Loss
-            # Loss = lam * Loss(A) + (1-lam) * Loss(B)
-            loss = lam * criterion(out, batch_y) + (1 - lam) * criterion(out, batch_y_partner)
-        else:
-            # Standard training if batch is too small or mixup is off
-            optimizer.zero_grad()
-            out = model(batch_X)
-            loss = criterion(out, batch_y)
-            
-        # --- MIXUP LOGIC END ---
-
+        optimizer.zero_grad()
+        out = model(batch_X)
+        loss = criterion(out, batch_y)
         loss.backward()
         optimizer.step()
+        
+        # CRITICAL: Manifold Correction
+        stiefel_optimizer_step(model)
+        
         total_loss += loss.item()
         
-    return total_loss / (X.size(0) / batch_size)
-@torch.no_grad()
-def test_transformer(X, y, model, batch_size):
+    # Validation
     model.eval()
-    correct = 0
-    for i in range(0, X.size(0), batch_size):
-        # No shuffling for testing
-        batch_X = X[i:i+batch_size]
-        batch_y = y[i:i+batch_size]
-        
-        out = model(batch_X)
+    with torch.no_grad():
+        out = model(val_X)
         pred = out.argmax(dim=1)
-        correct += int((pred == batch_y).sum())
-    return correct / len(y)
+        val_acc = int((pred == val_y).sum()) / len(val_y)
+        
+        test_out = model(test_X)
+        test_pred = test_out.argmax(dim=1)
+        test_acc = int((test_pred == test_y).sum()) / len(test_y)
+    
+    print(f"Epoch {epoch}: Loss {total_loss:.6f}, Val {val_acc:.6f}, Test {test_acc:.6f}")
+    
+    if val_acc > best_acc:
+        best_acc = val_acc
+        torch.save(model.state_dict(), "spdnet_best.pkl")
 
-# ... [After the test_transformer function] ...
-seeds = [args.seed + i for i in range(args.runs)]
-for index in range(args.runs):
-    print(f"--- RUN {index+1}/{args.runs} ---")
-    fix_seed(seeds[index])
-    
-    model = BrainTransformer(
-        num_nodes=num_nodes, 
-        d_model=args.d_model, # Keeping your original size
-        nhead=4,              # Keeping original heads
-        num_layers=2,         # Keeping original layers
-        num_classes=args.num_classes
-    ).to(args.device)
-    
-    # UPGRADE 1: Cosine Scheduler
-    # Starts at lr=0.0005 and lowers it to 0 by the end
-    optimizer = Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
-    # UPGRADE 2: Label Smoothing
-    # Prevents the model from being "too confident" (Overfitting)
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-    
-    best_val_acc = 0.0
-    
-    for epoch in range(args.epochs):
-        # Train
-        loss = train_transformer(train_X, train_y, model, optimizer, args.batch_size)
-        
-        # Step the scheduler
-        scheduler.step()
-        
-        # Test
-        val_acc = test_transformer(val_X, val_y, model, args.batch_size)
-        test_acc = test_transformer(test_X, test_y, model, args.batch_size)
-        
-        # Print current LR to verify scheduler is working
-        current_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch: {epoch}, Loss: {loss:.4f}, LR: {current_lr:.6f}, Val: {val_acc:.2f}, Test: {test_acc:.2f}")
-        
-        if val_acc >= best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), path + args.dataset + 'Transformer' + 'best.pkl')
-
-    # Final Check
-    print(f"Best Validation Accuracy: {best_val_acc:.2f}")
+print(f"Final Best Val Accuracy: {best_acc:.6f}")
