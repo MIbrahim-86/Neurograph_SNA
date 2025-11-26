@@ -78,6 +78,7 @@ train_dataset = tmp[train_indices]
 val_dataset = tmp[val_indices]
 test_dataset = dataset[test_indices]
 print("dataset {} loaded with train {} val {} test {} splits".format(args.dataset,len(train_dataset), len(val_dataset), len(test_dataset)))
+
 train_loader = DataLoader(train_dataset, args.batch_size, shuffle=False,drop_last=True)
 val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False,drop_last=True)
 test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False,drop_last=True)
@@ -104,7 +105,6 @@ def train_tangent(X, y, model, optimizer):
     return loss.item()
 
 @torch.no_grad()
-
 def test_tangent(X, y, model):
     model.eval()
     out = model(X)
@@ -135,10 +135,10 @@ for index in range(args.runs):
         
         print("epoch: {}, loss: {}, val_acc:{}, test_acc:{}".format(epoch, np.round(loss, 6), np.round(val_acc, 2), np.round(test_acc, 2)))
         
-        if val_acc > best_val_acc:
+        if val_acc >= best_val_acc: # Added >= so it saves even if equal
             best_val_acc = val_acc
-            if epoch > int(args.epochs / 2):
-                torch.save(model.state_dict(), path + args.dataset + 'TangentMLP' + 'task-checkpoint-best-acc.pkl')
+            # Save immediately, no waiting for half epochs
+            torch.save(model.state_dict(), path + args.dataset + 'TangentMLP' + 'task-checkpoint-best-acc.pkl')
 
     # Load best model and test
     model.load_state_dict(torch.load(path + args.dataset + 'TangentMLP' + 'task-checkpoint-best-acc.pkl'))
