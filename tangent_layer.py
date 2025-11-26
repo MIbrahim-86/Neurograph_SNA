@@ -1,12 +1,10 @@
 import torch
 import numpy as np
-from pyriemann.tangentspace import TangentSpace
 
-def make_pd(matrices, epsilon=1e-4):
+def map_to_tangent_matrix(matrices, epsilon=1e-4):
     """
-    Forces matrices to be Symmetric Positive Definite (SPD) by:
-    1. Symmetrizing: (A + A.T) / 2
-    2. Eigen-clipping: Setting all negative eigenvalues to epsilon
+    Performs the Log-Euclidean Map manually to keep the matrix structure.
+    Formula: Log(C) = U * Log(Eigenvalues) * U.T
     """
     # 1. Force Symmetry
     matrices = (matrices + np.swapaxes(matrices, 1, 2)) / 2.0
@@ -14,25 +12,24 @@ def make_pd(matrices, epsilon=1e-4):
     # 2. Eigen Decomposition
     eigvals, eigvecs = np.linalg.eigh(matrices)
     
-    # 3. Clip eigenvalues (Set any val < epsilon to epsilon)
+    # 3. Clip negative eigenvalues (Repair broken matrices)
     eigvals[eigvals < epsilon] = epsilon
     
-    # 4. Reconstruct
-    # (V * diag(vals) * V.T)
-    # We use broadcasting to multiply (N, D, D) by (N, D)
-    reconstructed = np.matmul(eigvecs * eigvals[:, np.newaxis, :], np.swapaxes(eigvecs, 1, 2))
+    # 4. Apply Logarithm to Eigenvalues (The Tangent Projection)
+    # This flattens the manifold curvature
+    log_eigvals = np.log(eigvals)
+    
+    # 5. Reconstruct the Matrix (U * Log(Eig) * U.T)
+    # Broadcasting: (N, D, D) * (N, D, 1) -> (N, D, D)
+    reconstructed = np.matmul(eigvecs * log_eigvals[:, np.newaxis, :], np.swapaxes(eigvecs, 1, 2))
     
     return reconstructed
 
-def project_to_tangent_space(loader, device):
-    """
-    Takes a PyG Data Loader, extracts correlation matrices, 
-    repairs them, and converts to Tangent Space.
-    """
+def project_to_tangent_matrix(loader, device):
     all_matrices = []
     all_labels = []
     
-    print("Extracting matrices...")
+    print("Extracting and projecting matrices...")
     
     for data in loader:
         num_graphs = data.num_graphs
@@ -40,8 +37,6 @@ def project_to_tangent_space(loader, device):
         
         # Reshape into (Batch_Size, Num_Nodes, Num_Nodes)
         matrices = data.x.reshape(num_graphs, num_nodes, num_nodes).cpu().numpy()
-        
-        # Check for NaNs just in case and replace with 0
         matrices = np.nan_to_num(matrices)
         
         all_matrices.append(matrices)
@@ -50,34 +45,23 @@ def project_to_tangent_space(loader, device):
     X = np.concatenate(all_matrices)
     y = np.concatenate(all_labels)
 
-    # --- THE FIX IS HERE ---
-    print(f"Repairing {len(X)} matrices to ensure Positive Definiteness...")
-    X = make_pd(X)
-    # -----------------------
+    # Transform to Tangent Matrix
+    X_tangent = map_to_tangent_matrix(X)
 
-    return X, y
+    # Return as (N, 1000, 1000)
+    return (torch.tensor(X_tangent, dtype=torch.float32).to(device), torch.tensor(y).to(device))
 
-def fit_transform_tangent(train_loader, val_loader, test_loader, device):
-    # 1. Load and Repair Matrices
-    X_train, y_train = project_to_tangent_space(train_loader, device)
-    X_val, y_val = project_to_tangent_space(val_loader, device)
-    X_test, y_test = project_to_tangent_space(test_loader, device)
-
-    print(f"Fitting Tangent Space on {len(X_train)} training subjects (1000x1000)...")
-    print("Using Log-Euclidean metric for speed optimization.")
-
-    # 2. Initialize with 'logeuclid' metric (FAST)
-    # n_jobs=-1 uses all CPU cores to speed up the projection
-    ts = TangentSpace(metric='logeuclid') 
+def get_dataloaders_tangent(train_loader, val_loader, test_loader, device):
+    """
+    Wrapper to process all sets
+    """
+    print("Processing Training Set...")
+    train_data = project_to_tangent_matrix(train_loader, device)
     
-    # 3. Fit and Transform
-    # This should now take minutes instead of hours
-    X_train_ts = ts.fit_transform(X_train)
-    X_val_ts = ts.transform(X_val)
-    X_test_ts = ts.transform(X_test)
-
-    print("Tangent Space projection complete.")
+    print("Processing Validation Set...")
+    val_data = project_to_tangent_matrix(val_loader, device)
     
-    return (torch.tensor(X_train_ts, dtype=torch.float32).to(device), torch.tensor(y_train).to(device)), \
-           (torch.tensor(X_val_ts, dtype=torch.float32).to(device), torch.tensor(y_val).to(device)), \
-           (torch.tensor(X_test_ts, dtype=torch.float32).to(device), torch.tensor(y_test).to(device))
+    print("Processing Test Set...")
+    test_data = project_to_tangent_matrix(test_loader, device)
+    
+    return train_data, val_data, test_data
