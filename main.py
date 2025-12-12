@@ -1,5 +1,7 @@
 from NeuroGraph.datasets import NeuroGraphDataset
 import argparse
+import glob
+import os
 import torch
 import torch.nn as nn
 from torch.optim import Adam
@@ -51,6 +53,44 @@ class SPDNet(nn.Module):
         x_flat = x[:, idx[0], idx[1]]
         
         return self.classifier(x_flat)
+    
+    
+    
+def save_if_new_record(model, dataset_name, current_acc):
+    # 1. Search for existing best files for this dataset
+    # Pattern: "spdnet_best_HCPAge_*.pkl"
+    existing_files = glob.glob(f"spdnet_best_{dataset_name}_*.pkl")
+    
+    previous_record = 0.0
+    file_to_delete = None
+
+    if existing_files:
+        # 2. Extract the accuracy from the filename
+        # Example: "spdnet_best_HCPAge_0.6021.pkl" -> 0.6021
+        for f in existing_files:
+            try:
+                # Split by '_' and take the last part, remove .pkl
+                acc_str = f.split('_')[-1].replace('.pkl', '')
+                acc = float(acc_str)
+                
+                if acc > previous_record:
+                    previous_record = acc
+                    file_to_delete = f
+            except:
+                pass # Ignore badly named files
+
+    # 3. Compare: Is the new one better?
+    if current_acc > previous_record:
+        print(f"🏆 NEW RECORD! ({current_acc:.4f} > {previous_record:.4f}). Saving model...")
+        
+        # Delete the old weak model
+        if file_to_delete:
+            os.remove(file_to_delete)
+        
+        # Save the new champion
+        torch.save(model.state_dict(), f"spdnet_best_{dataset_name}_{current_acc:.4f}.pkl")
+    else:
+        print(f"❌ Current ({current_acc:.4f}) did not beat record ({previous_record:.4f}). Discarding.")
 
 # --- HELPER: GET RAW MATRICES (NO LOG) ---
 def get_raw_matrices(loader, device):
@@ -163,6 +203,15 @@ for epoch in range(args.epochs):
     
     if val_acc > best_acc:
         best_acc = val_acc
-        torch.save(model.state_dict(), "spdnet_best.pkl")
+        # We don't save to disk yet, we just remember it for this session.
+        # We will check against the All-Time Record at the very end.
+        best_model_state = model.state_dict() # Keep a copy in RAM
+
+# --- END OF LOOP ---
+print(f"Final Best Session Accuracy: {best_acc:.6f}")
+
+if best_acc > 0:
+    model.load_state_dict(best_model_state)
+    save_if_new_record(model, args.dataset, best_acc)
 
 print(f"Final Best Val Accuracy: {best_acc:.6f}")
