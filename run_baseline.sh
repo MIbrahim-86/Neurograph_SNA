@@ -1,6 +1,6 @@
 dataset="HCPGender"
 batch_size="16"
-model="GCNConv"
-hidden="64"
-main="main_new.py"
-python $main --dataset $dataset --model $model --device 'cuda' --batch_size $batch_size --runs 10
+epochs="100"
+mid_dim="48"
+main="main.py"
+python $main --dataset $dataset --epochs $epochs --batch_size $batch_size --mid_dim $mid_dim
