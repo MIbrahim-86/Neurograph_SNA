@@ -30,17 +30,17 @@ class ReEig(nn.Module):
         # Eigen Decomposition
         # We use standard PyTorch eigh (batch-supported)
         eigvals, eigvecs = torch.linalg.eigh(x)
-        
+       
         # Rectify: Threshold eigenvalues (max(val, epsilon))
         eigvals = torch.clamp(eigvals, min=self.epsilon)
-        
+       
         # Reconstruct: U * Thresholded_Sigma * U.T
         # Broadcasting logic to multiply correct dims
         rec = torch.matmul(eigvecs * eigvals.unsqueeze(1), eigvecs.transpose(-2, -1))
         return rec
 
 # 3. LogEig Layer (Log-Euclidean Projection)
-# Concept: This is the "Flattening" step. 
+# Concept: This is the "Flattening" step.
 # We do this ONLY at the very end, after the BiMap has optimized the view.
 class LogEig(nn.Module):
     def __init__(self):
@@ -48,11 +48,11 @@ class LogEig(nn.Module):
 
     def forward(self, x):
         eigvals, eigvecs = torch.linalg.eigh(x)
-        
+       
         # Logarithm of eigenvalues
         # (This linearizes the curved distances)
         eigvals = torch.log(torch.clamp(eigvals, min=1e-6))
-        
+       
         # Reconstruct
         out = torch.matmul(eigvecs * eigvals.unsqueeze(1), eigvecs.transpose(-2, -1))
         return out

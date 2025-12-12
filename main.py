@@ -1,126 +1,168 @@
 from NeuroGraph.datasets import NeuroGraphDataset
 import argparse
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.optim import Adam
 import numpy as np
-from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from torch_geometric.loader import DataLoader
-import os,random
-import os.path as osp
-import sys
-import time
-from utils import *
+import os
+from utils import fix_seed
+from tangent_layer import map_to_tangent_matrix # Ensure tangent_layer.py exists
+from spdnet_layer import BiMap, ReEig, LogEig, stiefel_optimizer_step
 
+# --- SPDNET ARCHITECTURE ---
+class SPDNet(nn.Module):
+    def __init__(self, in_dim, mid_dim, num_classes):
+        super(SPDNet, self).__init__()
+        
+        # Layer 1: Compress 1000x1000 -> 64x64
+        # This effectively learns the "Principal Components" on the manifold
+        self.layer1 = BiMap(in_dim, mid_dim)
+        self.act1 = ReEig()
+        
+        # Layer 2: Compress 64x64 -> 32x32 (Optional deep layer)
+        self.layer2 = BiMap(mid_dim, mid_dim // 2)
+        self.act2 = ReEig()
+        
+        # Layer 3: Flatten (Tangent Projection)
+        self.log_eig = LogEig()
+        
+        # Layer 4: Standard Linear Classifier
+        # Input size is the upper triangle of the resulting matrix
+        flat_dim = ((mid_dim // 2) * ((mid_dim // 2) + 1)) // 2
+        self.classifier = nn.Linear(flat_dim, num_classes)
+
+    def forward(self, x):
+        # x: (Batch, 1000, 1000)
+        
+        x = self.layer1(x) # -> (Batch, 64, 64)
+        x = self.act1(x)
+        
+        x = self.layer2(x) # -> (Batch, 32, 32)
+        x = self.act2(x)
+        
+        x = self.log_eig(x)
+        
+        # Vectorize (Take upper triangle only)
+        # Because the result is symmetric, we only need half the values
+        batch, r, c = x.shape
+        idx = torch.triu_indices(r, c)
+        x_flat = x[:, idx[0], idx[1]]
+        
+        return self.classifier(x_flat)
+
+# --- HELPER: GET RAW MATRICES (NO LOG) ---
+def get_raw_matrices(loader, device):
+    all_matrices = []
+    all_labels = []
+    
+    print("Loading data to GPU for preprocessing...")
+    
+    for data in loader:
+        # 1. Keep data as PyTorch Tensors and move to GPU immediately
+        num_graphs = data.num_graphs
+        num_nodes = data.x.shape[0] // num_graphs
+        
+        # Reshape: (Batch, 1000, 1000)
+        matrices = data.x.reshape(num_graphs, num_nodes, num_nodes).to(device)
+        labels = data.y.to(device)
+        
+        # 2. Symmetrize (on GPU)
+        # (A + A.T) / 2
+        matrices = (matrices + matrices.transpose(1, 2)) / 2.0
+        
+        # 3. Eigen Decomposition (on GPU)
+        # torch.linalg.eigh is MUCH faster than np.linalg.eigh
+        L, V = torch.linalg.eigh(matrices)
+        
+        # 4. Clip/Repair Eigenvalues
+        L = torch.clamp(L, min=1e-4)
+        
+        # 5. Reconstruct
+        # V @ diag(L) @ V.T
+        rec = torch.matmul(V * L.unsqueeze(1), V.transpose(-2, -1))
+        
+        all_matrices.append(rec)
+        all_labels.append(labels)
+    
+    # Concatenate all batches
+    X = torch.cat(all_matrices, dim=0)
+    y = torch.cat(all_labels, dim=0)
+    
+    print(f"Loaded {X.shape[0]} matrices on {device}.")
+    return X, y
+
+# --- SETUP ---
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='HCPGender')
-parser.add_argument('--runs', type=int, default=1)
 parser.add_argument('--device', type=str, default='cuda')
-parser.add_argument('--seed', type=int, default=123)
-parser.add_argument('--model', type=str, default="GCNConv")
-parser.add_argument('--hidden', type=int, default=32)
-parser.add_argument('--hidden_mlp', type=int, default=64)
-parser.add_argument('--num_layers', type=int, default=3)
 parser.add_argument('--epochs', type=int, default=100)
-parser.add_argument('--echo_epoch', type=int, default=50)
 parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--early_stopping', type=int, default=50)
-parser.add_argument('--lr', type=float, default=1e-5)
-parser.add_argument('--weight_decay', type=float, default=0.0005)
-parser.add_argument('--dropout', type=float, default=0.5)
+parser.add_argument('--lr', type=float, default=0.01)
+parser.add_argument('--mid_dim', type=int, default=48) # Target dimension for BiMap
 args = parser.parse_args()
-path = "base_params/"
-res_path = "results/"
-root = "data/"
-if not os.path.isdir(path):
-    os.mkdir(path)
-if not os.path.isdir(res_path):
-    os.mkdir(res_path)
-def logger(info):
-    f = open(os.path.join(res_path, 'results_new.csv'), 'a')
-    print(info, file=f)
 
-fix_seed(args.seed)
-dataset = NeuroGraphDataset(root=root, name= args.dataset)
-print(dataset.num_classes)
-print(len(dataset))
-
-print("dataset loaded successfully!",args.dataset)
+fix_seed(123)
+dataset = NeuroGraphDataset(root="data/", name=args.dataset)
+# ... [Split code same as before] ...
+# (Copy the train/test/val splitting code from your previous main.py)
 labels = [d.y.item() for d in dataset]
-
-train_tmp, test_indices = train_test_split(list(range(len(labels))),
-                        test_size=0.2, stratify=labels,random_state=args.seed,shuffle= True)
+train_tmp, test_indices = train_test_split(list(range(len(labels))), test_size=0.2, stratify=labels, random_state=123, shuffle=True)
 tmp = dataset[train_tmp]
 train_labels = [d.y.item() for d in tmp]
-train_indices, val_indices = train_test_split(list(range(len(train_labels))),
- test_size=0.125, stratify=train_labels,random_state=args.seed,shuffle = True)
-train_dataset = tmp[train_indices]
-val_dataset = tmp[val_indices]
-test_dataset = dataset[test_indices]
-print("dataset {} loaded with train {} val {} test {} splits".format(args.dataset,len(train_dataset), len(val_dataset), len(test_dataset)))
-train_loader = DataLoader(train_dataset, args.batch_size, shuffle=False)
-val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False)
-test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False)
-args.num_features,args.num_classes = dataset.num_features,dataset.num_classes
+train_indices, val_indices = train_test_split(list(range(len(train_labels))), test_size=0.125, stratify=train_labels, random_state=123, shuffle=True)
+train_loader = DataLoader(tmp[train_indices], args.batch_size, shuffle=False, drop_last=True)
+val_loader = DataLoader(tmp[val_indices], args.batch_size, shuffle=False, drop_last=True)
+test_loader = DataLoader(dataset[test_indices], args.batch_size, shuffle=False, drop_last=True)
 
-criterion = torch.nn.CrossEntropyLoss()
-#criterion = torch.nn.L1Loss()
-def train(train_loader):
+# Load Data (Raw SPD Matrices)
+train_X, train_y = get_raw_matrices(train_loader, args.device)
+val_X, val_y = get_raw_matrices(val_loader, args.device)
+test_X, test_y = get_raw_matrices(test_loader, args.device)
+
+# Initialize
+model = SPDNet(in_dim=train_X.shape[1], mid_dim=args.mid_dim, num_classes=dataset.num_classes).to(args.device)
+optimizer = Adam(model.parameters(), lr=args.lr) # SPDNet often needs higher LR
+criterion = nn.CrossEntropyLoss()
+
+# --- TRAINING LOOP ---
+best_acc = 0.0
+for epoch in range(args.epochs):
     model.train()
+    indices = torch.randperm(train_X.size(0))
     total_loss = 0
-    for data in train_loader:  
-        data = data.to(args.device)
-        out = model(data)  
-        loss = criterion(out, data.y) 
-        total_loss +=loss
-        loss.backward()
-        optimizer.step() 
+    
+    for i in range(0, train_X.size(0), args.batch_size):
+        idx = indices[i:i+args.batch_size]
+        batch_X, batch_y = train_X[idx], train_y[idx]
+        
         optimizer.zero_grad()
-    return total_loss/len(train_loader.dataset)
-    # return total_loss/len(train_loader) # For L1 loss. This may retun higher loss on the regression tasks since the paper used (total_loss/len(train_loader.dataset))
-
-@torch.no_grad()
-def test(loader):
+        out = model(batch_X)
+        loss = criterion(out, batch_y)
+        loss.backward()
+        optimizer.step()
+        
+        # CRITICAL: Manifold Correction
+        stiefel_optimizer_step(model)
+        
+        total_loss += loss.item()
+        
+    # Validation
     model.eval()
-    correct = 0
-    for data in loader:  
-        data = data.to(args.device)
-        out = model(data)  
-        pred = out.argmax(dim=1)  
-        correct += int((pred == data.y).sum())
-    return correct / len(loader.dataset)  
+    with torch.no_grad():
+        out = model(val_X)
+        pred = out.argmax(dim=1)
+        val_acc = int((pred == val_y).sum()) / len(val_y)
+        
+        test_out = model(test_X)
+        test_pred = test_out.argmax(dim=1)
+        test_acc = int((test_pred == test_y).sum()) / len(test_y)
+    
+    print(f"Epoch {epoch}: Loss {total_loss:.6f}, Val {val_acc:.6f}, Test {test_acc:.6f}")
+    
+    if val_acc > best_acc:
+        best_acc = val_acc
+        torch.save(model.state_dict(), "spdnet_best.pkl")
 
-val_acc_history, test_acc_history, test_loss_history = [],[],[]
-seeds = [123,124]
-for index in range(args.runs):
-    start = time.time()
-    fix_seed(seeds[index])
-    gnn = eval(args.model)
-    model = ResidualGNNs(args,train_dataset,args.hidden,args.hidden_mlp,args.num_layers,gnn).to(args.device) ## apply GNN*
-    print(model)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total number of parameters is: {total_params}")
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss, test_acc = [],[]
-    best_val_acc,best_val_loss = 0.0,0.0
-    for epoch in range(args.epochs):
-        loss = train(train_loader)
-        val_acc = test(val_loader)
-        test_acc = test(test_loader)
-        # if epoch%10==0:
-        print("epoch: {}, loss: {}, val_acc:{}, test_acc:{}".format(epoch, np.round(loss.item(),6), np.round(val_acc,2),np.round(test_acc,2)))
-        val_acc_history.append(val_acc)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            if epoch> int(args.epochs/2):## save the best model
-                torch.save(model.state_dict(), path + args.dataset+args.model+'task-checkpoint-best-acc.pkl')
-       
-
-    #test the model   
-    model.load_state_dict(torch.load(path + args.dataset+args.model+'task-checkpoint-best-acc.pkl'))
-    model.eval()
-    test_acc = test(test_loader)
-    test_loss = train(test_loader).item()
-    test_acc_history.append(test_acc)
-    test_loss_history.append(test_loss)
+print(f"Final Best Val Accuracy: {best_acc:.6f}")

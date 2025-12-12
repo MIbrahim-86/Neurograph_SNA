@@ -37,7 +37,7 @@ class ResidualGNNs(torch.nn.Module):
                 self.convs.append(GNN(num_features, hidden_channels))
                 for i in range(0, num_layers - 1):
                     self.convs.append(GNN(hidden_channels, hidden_channels))
-        
+       
         input_dim1 = int(((num_features * num_features)/2)- (num_features/2)+(hidden_channels*num_layers))
         input_dim = int(((num_features * num_features)/2)- (num_features/2))
         self.bn = nn.BatchNorm1d(input_dim)
@@ -57,24 +57,3 @@ class ResidualGNNs(torch.nn.Module):
             nn.Dropout(0.5),
             nn.Linear((hidden//2), args.num_classes),
         )
-
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-        xs = [x]        
-        for conv in self.convs:
-            xs += [conv(xs[-1], edge_index).tanh()]
-        h = []
-        for i, xx in enumerate(xs):
-            if i== 0:
-                xx = xx.reshape(data.num_graphs, x.shape[1],-1)
-                x = torch.stack([t.triu().flatten()[t.triu().flatten().nonzero(as_tuple=True)] for t in xx])
-                x = self.bn(x)
-            else:
-                xx = self.aggr(xx,batch)
-                h.append(xx)
-        
-        h = torch.cat(h,dim=1)
-        h = self.bnh(h)
-        x = torch.cat((x,h),dim=1)
-        x = self.mlp(x)
-        return softmax(x)
